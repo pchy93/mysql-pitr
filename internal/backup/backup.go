@@ -2,8 +2,6 @@
 package backup
 
 import (
-	"archive/tar"
-	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -11,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -22,32 +21,34 @@ const metaFileName = "backup.meta.json"
 
 // Config holds backup configuration.
 type Config struct {
-	// MySQL connection
 	Host     string
 	Port     int
 	User     string
 	Password string
-	Socket   string // optional unix socket
+	Socket   string
 
-	// xtrabackup binary path (defaults to "xtrabackup")
 	XtrabackupBin string
+	TempDir       string
+	S3Prefix      string
 
-	// Temporary directory for xtrabackup output before upload
-	TempDir string
+	// Compression algorithm: "none", "gzip", "zstd" (default: "zstd")
+	Compression string
 
-	// S3 key prefix for backups, e.g. "backups/"
-	S3Prefix string
+	// Parallelism for compression and upload
+	Parallel int
 }
 
 // Meta holds metadata stored alongside a backup in S3.
 type Meta struct {
-	BackupID    string    `json:"backup_id"`
-	StartTime   time.Time `json:"start_time"`
-	FinishTime  time.Time `json:"finish_time"`
-	BinlogFile  string    `json:"binlog_file"`
-	BinlogPos   uint32    `json:"binlog_pos"`
-	GTIDSet     string    `json:"gtid_set,omitempty"`
-	MySQLVersion string   `json:"mysql_version,omitempty"`
+	BackupID     string    `json:"backup_id"`
+	StartTime    time.Time `json:"start_time"`
+	FinishTime   time.Time `json:"finish_time"`
+	BinlogFile   string    `json:"binlog_file"`
+	BinlogPos    uint32    `json:"binlog_pos"`
+	GTIDSet      string    `json:"gtid_set,omitempty"`
+	MySQLVersion string    `json:"mysql_version,omitempty"`
+	SizeBytes    int64     `json:"size_bytes,omitempty"`
+	Compression  string    `json:"compression,omitempty"`
 }
 
 // Runner runs full backups.
@@ -65,100 +66,191 @@ func New(cfg Config, store *s3store.Client, logger *zap.Logger) *Runner {
 	if cfg.TempDir == "" {
 		cfg.TempDir = os.TempDir()
 	}
+	if cfg.Compression == "" {
+		cfg.Compression = "zstd"
+	}
+	if cfg.Parallel <= 0 {
+		cfg.Parallel = 4
+	}
 	return &Runner{cfg: cfg, store: store, logger: logger}
 }
 
-// Run performs a full backup and uploads it to S3.
-// Returns the backup ID (used later to locate the backup on S3).
+// Run performs a full backup and uploads it to S3 using streaming (no intermediate disk storage).
 func (r *Runner) Run(ctx context.Context) (string, error) {
 	backupID := fmt.Sprintf("full-%s", time.Now().UTC().Format("20060102T150405Z"))
-	workDir := filepath.Join(r.cfg.TempDir, backupID)
+	metaDir := filepath.Join(r.cfg.TempDir, backupID+"-meta")
 
-	r.logger.Info("starting full backup", zap.String("backup_id", backupID), zap.String("work_dir", workDir))
+	r.logger.Info("starting streaming backup",
+		zap.String("backup_id", backupID),
+		zap.String("compression", r.cfg.Compression),
+		zap.Int("parallel", r.cfg.Parallel),
+	)
 
-	if err := os.MkdirAll(workDir, 0o750); err != nil {
-		return "", fmt.Errorf("create work dir: %w", err)
+	if err := os.MkdirAll(metaDir, 0o750); err != nil {
+		return "", fmt.Errorf("create meta dir: %w", err)
 	}
-	defer os.RemoveAll(workDir)
+	defer os.RemoveAll(metaDir)
 
 	startTime := time.Now().UTC()
-	if err := r.runXtrabackup(ctx, workDir); err != nil {
-		return "", fmt.Errorf("xtrabackup: %w", err)
+
+	s3Key := fmt.Sprintf("%s%s/backup.xb", r.cfg.S3Prefix, backupID)
+	if r.cfg.Compression == "gzip" {
+		s3Key = fmt.Sprintf("%s%s/backup.xb.gz", r.cfg.S3Prefix, backupID)
+	} else if r.cfg.Compression == "zstd" {
+		s3Key = fmt.Sprintf("%s%s/backup.xb.zst", r.cfg.S3Prefix, backupID)
 	}
 
-	meta, err := r.extractMeta(workDir, backupID, startTime)
+	size, err := r.runStreamingBackup(ctx, metaDir, s3Key)
+	if err != nil {
+		return "", fmt.Errorf("streaming backup: %w", err)
+	}
+
+	meta, err := r.extractMeta(metaDir, backupID, startTime)
 	if err != nil {
 		return "", fmt.Errorf("extract meta: %w", err)
 	}
+	meta.SizeBytes = size
+	meta.Compression = r.cfg.Compression
 
 	r.logger.Info("xtrabackup finished",
 		zap.String("binlog_file", meta.BinlogFile),
 		zap.Uint32("binlog_pos", meta.BinlogPos),
-		zap.String("gtid_set", meta.GTIDSet),
+		zap.Int64("size_bytes", size),
 	)
 
-	if err := r.uploadBackup(ctx, backupID, workDir, meta); err != nil {
-		return "", fmt.Errorf("upload backup: %w", err)
+	if err := r.uploadMeta(ctx, backupID, meta); err != nil {
+		return "", fmt.Errorf("upload meta: %w", err)
 	}
 
-	r.logger.Info("backup uploaded successfully", zap.String("backup_id", backupID))
+	r.logger.Info("backup completed successfully", zap.String("backup_id", backupID))
 	return backupID, nil
 }
 
-// runXtrabackup executes xtrabackup --backup.
-func (r *Runner) runXtrabackup(ctx context.Context, targetDir string) error {
+// runStreamingBackup runs xtrabackup with --stream and pipes output directly to S3.
+func (r *Runner) runStreamingBackup(ctx context.Context, metaDir, s3Key string) (int64, error) {
+	// Build xtrabackup command with streaming
 	args := []string{
 		"--backup",
-		fmt.Sprintf("--target-dir=%s", targetDir),
+		fmt.Sprintf("--stream=xbstream"),
+		fmt.Sprintf("--target-dir=%s", metaDir),
 		fmt.Sprintf("--host=%s", r.cfg.Host),
 		fmt.Sprintf("--port=%d", r.cfg.Port),
 		fmt.Sprintf("--user=%s", r.cfg.User),
+		fmt.Sprintf("--parallel=%d", r.cfg.Parallel),
 	}
 
 	if r.cfg.Socket != "" {
 		args = append(args, fmt.Sprintf("--socket=%s", r.cfg.Socket))
 	}
+	args = append(args, fmt.Sprintf("--password=%s", r.cfg.Password))
 
-	// Pass password via environment variable to avoid shell history exposure.
 	cmd := exec.CommandContext(ctx, r.cfg.XtrabackupBin, args...)
-	cmd.Env = append(os.Environ(), fmt.Sprintf("XTRABACKUP_PASSWORD=%s", r.cfg.Password))
-	// xtrabackup reads password from --password flag; use env workaround via stdin or flag.
-	// For simplicity we append as flag (password is not logged).
-	cmd.Args = append(cmd.Args, fmt.Sprintf("--password=%s", r.cfg.Password))
-
-	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	r.logger.Info("running xtrabackup", zap.Strings("args", cmd.Args[:len(cmd.Args)-1])) // omit password
-	return cmd.Run()
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return 0, fmt.Errorf("stdout pipe: %w", err)
+	}
+
+	r.logger.Info("starting xtrabackup streaming",
+		zap.String("s3_key", s3Key),
+		zap.Strings("args", filterPassword(cmd.Args)),
+	)
+
+	if err := cmd.Start(); err != nil {
+		return 0, fmt.Errorf("start xtrabackup: %w", err)
+	}
+
+	// Create streaming uploader
+	uploader, err := r.store.NewStreamingUploader(ctx, s3Key)
+	if err != nil {
+		cmd.Process.Kill()
+		return 0, fmt.Errorf("create uploader: %w", err)
+	}
+
+	// Pipe through compression if needed
+	var reader io.Reader = stdout
+	var compressor io.Closer
+
+	switch r.cfg.Compression {
+	case "gzip":
+		// For streaming gzip, we use a pipe
+		pr, pw := io.Pipe()
+		go func() {
+			gw := newGzipWriter(pw)
+			if _, err := io.Copy(gw, stdout); err != nil {
+				pw.CloseWithError(err)
+			} else {
+				gw.Close()
+				pw.Close()
+			}
+		}()
+		reader = pr
+	case "zstd":
+		pr, pw := io.Pipe()
+		go func() {
+			zw := newZstdWriter(pw)
+			if _, err := io.Copy(zw, stdout); err != nil {
+				pw.CloseWithError(err)
+			} else {
+				zw.Close()
+				pw.Close()
+			}
+		}()
+		reader = pr
+	default:
+		// no compression
+	}
+
+	// Copy to S3
+	size, err := io.Copy(uploader, reader)
+	if err != nil {
+		uploader.Close()
+		cmd.Process.Kill()
+		return 0, fmt.Errorf("copy to s3: %w", err)
+	}
+
+	if compressor != nil {
+		compressor.Close()
+	}
+
+	if err := cmd.Wait(); err != nil {
+		uploader.Close()
+		return 0, fmt.Errorf("xtrabackup wait: %w", err)
+	}
+
+	if err := uploader.Close(); err != nil {
+		return 0, fmt.Errorf("close uploader: %w", err)
+	}
+
+	return size, nil
 }
 
-// extractMeta reads xtrabackup_binlog_info and xtrabackup_info to build Meta.
-func (r *Runner) extractMeta(workDir, backupID string, startTime time.Time) (*Meta, error) {
+// extractMeta reads metadata files from the meta directory.
+func (r *Runner) extractMeta(metaDir, backupID string, startTime time.Time) (*Meta, error) {
 	meta := &Meta{
-		BackupID:  backupID,
-		StartTime: startTime,
+		BackupID:   backupID,
+		StartTime:  startTime,
 		FinishTime: time.Now().UTC(),
 	}
 
-	// Parse xtrabackup_binlog_info: "<binlog_file>\t<pos>\t[gtid_set]"
-	binlogInfo, err := os.ReadFile(filepath.Join(workDir, "xtrabackup_binlog_info"))
+	// Read xtrabackup_binlog_info
+	binlogInfo, err := os.ReadFile(filepath.Join(metaDir, "xtrabackup_binlog_info"))
 	if err != nil {
 		return nil, fmt.Errorf("read xtrabackup_binlog_info: %w", err)
 	}
+
 	if _, err := fmt.Sscanf(string(binlogInfo), "%s\t%d", &meta.BinlogFile, &meta.BinlogPos); err != nil {
-		// Try space-separated fallback
 		fmt.Sscanf(string(binlogInfo), "%s %d", &meta.BinlogFile, &meta.BinlogPos)
 	}
 
-	// Try to get GTID set (third field in binlog_info or from xtrabackup_info)
 	fields := splitFields(string(binlogInfo))
 	if len(fields) >= 3 {
 		meta.GTIDSet = fields[2]
 	}
 
-	// Read MySQL version from xtrabackup_info if available
-	infoPath := filepath.Join(workDir, "xtrabackup_info")
+	// Read xtrabackup_info
+	infoPath := filepath.Join(metaDir, "xtrabackup_info")
 	if data, err := os.ReadFile(infoPath); err == nil {
 		meta.MySQLVersion = extractField(string(data), "mysql_version")
 	}
@@ -166,77 +258,27 @@ func (r *Runner) extractMeta(workDir, backupID string, startTime time.Time) (*Me
 	return meta, nil
 }
 
-// uploadBackup tars + gzips the backup directory and uploads to S3, then uploads meta.
-func (r *Runner) uploadBackup(ctx context.Context, backupID, workDir string, meta *Meta) error {
-	pr, pw := io.Pipe()
-
-	errCh := make(chan error, 1)
-	go func() {
-		defer pw.Close()
-		errCh <- tarGzDir(workDir, pw)
-	}()
-
-	s3Key := fmt.Sprintf("%s%s/backup.tar.gz", r.cfg.S3Prefix, backupID)
-	r.logger.Info("uploading backup archive", zap.String("s3_key", s3Key))
-
-	if err := r.store.UploadReader(ctx, s3Key, pr, -1); err != nil {
-		return fmt.Errorf("upload archive: %w", err)
-	}
-
-	if err := <-errCh; err != nil {
-		return fmt.Errorf("tar backup: %w", err)
-	}
-
-	// Upload metadata JSON
+func (r *Runner) uploadMeta(ctx context.Context, backupID string, meta *Meta) error {
 	metaBytes, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal meta: %w", err)
 	}
 	metaKey := fmt.Sprintf("%s%s/%s", r.cfg.S3Prefix, backupID, metaFileName)
-	if err := r.store.UploadReader(ctx, metaKey, jsonReader(metaBytes), int64(len(metaBytes))); err != nil {
-		return fmt.Errorf("upload meta: %w", err)
+	return r.store.UploadReader(ctx, metaKey, &byteReader{data: metaBytes}, int64(len(metaBytes)))
+}
+
+func filterPassword(args []string) []string {
+	result := make([]string, 0, len(args))
+	for _, a := range args {
+		if strings.HasPrefix(a, "--password=") {
+			result = append(result, "--password=***")
+		} else {
+			result = append(result, a)
+		}
 	}
-
-	return nil
+	return result
 }
 
-// tarGzDir creates a tar.gz archive of dir and writes it to w.
-func tarGzDir(dir string, w io.Writer) error {
-	gw := gzip.NewWriter(w)
-	defer gw.Close()
-	tw := tar.NewWriter(gw)
-	defer tw.Close()
-
-	return filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(dir, path)
-		if err != nil {
-			return err
-		}
-		hdr, err := tar.FileInfoHeader(info, "")
-		if err != nil {
-			return err
-		}
-		hdr.Name = rel
-		if err := tw.WriteHeader(hdr); err != nil {
-			return err
-		}
-		if !info.Mode().IsRegular() {
-			return nil
-		}
-		f, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-		_, err = io.Copy(tw, f)
-		return err
-	})
-}
-
-// splitFields splits a string by whitespace (tab or space).
 func splitFields(s string) []string {
 	var fields []string
 	cur := ""
@@ -256,37 +298,14 @@ func splitFields(s string) []string {
 	return fields
 }
 
-// extractField extracts "key = value" from xtrabackup_info content.
 func extractField(content, key string) string {
-	for _, line := range splitLines(content) {
+	for _, line := range strings.Split(content, "\n") {
 		var k, v string
 		if n, _ := fmt.Sscanf(line, "%s = %s", &k, &v); n == 2 && k == key {
 			return v
 		}
 	}
 	return ""
-}
-
-func splitLines(s string) []string {
-	var lines []string
-	cur := ""
-	for _, c := range s {
-		if c == '\n' {
-			lines = append(lines, cur)
-			cur = ""
-		} else {
-			cur += string(c)
-		}
-	}
-	if cur != "" {
-		lines = append(lines, cur)
-	}
-	return lines
-}
-
-// jsonReader wraps a byte slice as an io.Reader.
-func jsonReader(b []byte) io.Reader {
-	return &byteReader{data: b}
 }
 
 type byteReader struct {
