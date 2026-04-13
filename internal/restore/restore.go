@@ -2,7 +2,6 @@
 package restore
 
 import (
-	"archive/tar"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -12,8 +11,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	"go.uber.org/zap"
 
 	"github.com/mysql-pitr/mysql-pitr/internal/backup"
@@ -23,43 +24,28 @@ import (
 
 // Config holds restore configuration.
 type Config struct {
-	// BackupID to restore from (e.g. "full-20240101T120000Z").
-	// If empty, the latest full backup is used.
-	BackupID string
-
-	// TargetTime is the point-in-time to recover to.
-	// If zero, restore to the latest available position.
-	TargetTime time.Time
-
-	// S3Prefix is the top-level S3 prefix, same as used during backup.
-	S3Prefix string
-
-	// DataDir is the MySQL data directory on the target host.
-	DataDir string
-
-	// TempDir for intermediate files.
-	TempDir string
-
-	// Target MySQL instance (used to apply binlog via mysql client).
-	TargetHost     string
-	TargetPort     int
-	TargetUser     string
-	TargetPassword string
-	TargetSocket   string
-
-	// XtrabackupBin path (defaults to "xtrabackup")
-	XtrabackupBin string
-	// MysqlbinlogBin path (defaults to "mysqlbinlog")
-	MysqlbinlogBin string
-	// MysqlBin path (defaults to "mysql")
-	MysqlBin string
-
-	// MysqlShutdownCmd is a shell command to stop MySQL before restoring data files.
-	// e.g. "systemctl stop mysqld"
+	BackupID         string
+	TargetTime       time.Time
+	S3Prefix         string
+	DataDir          string
+	TempDir          string
+	TargetHost       string
+	TargetPort       int
+	TargetUser       string
+	TargetPassword   string
+	TargetSocket     string
+	XtrabackupBin    string
+	MysqlbinlogBin   string
+	MysqlBin         string
 	MysqlShutdownCmd string
-	// MysqlStartCmd is a shell command to start MySQL after data files are restored.
-	// e.g. "systemctl start mysqld"
-	MysqlStartCmd string
+	MysqlStartCmd    string
+	Parallel         int
+
+	// CopyMethod: "copy", "move", "hardlink"
+	// - copy: standard xtrabackup --copy-back (safest, but slowest)
+	// - move: xtrabackup --move-back (fast, but backup dir is emptied)
+	// - hardlink: use hard links (fast, requires same filesystem, backup can't be deleted)
+	CopyMethod string
 }
 
 // Runner performs the PITR restore.
@@ -83,17 +69,16 @@ func New(cfg Config, store *s3store.Client, logger *zap.Logger) *Runner {
 	if cfg.TempDir == "" {
 		cfg.TempDir = os.TempDir()
 	}
+	if cfg.Parallel <= 0 {
+		cfg.Parallel = 4
+	}
+	if cfg.CopyMethod == "" {
+		cfg.CopyMethod = "copy"
+	}
 	return &Runner{cfg: cfg, store: store, logger: logger}
 }
 
-// Run performs the full PITR restore sequence:
-//  1. Find the most suitable full backup
-//  2. Download and extract it
-//  3. Run xtrabackup --prepare
-//  4. Stop MySQL
-//  5. Copy-back data files
-//  6. Start MySQL
-//  7. Apply binlogs up to TargetTime
+// Run performs the full PITR restore sequence.
 func (r *Runner) Run(ctx context.Context) error {
 	workDir := filepath.Join(r.cfg.TempDir, fmt.Sprintf("restore-%d", time.Now().Unix()))
 	if err := os.MkdirAll(workDir, 0o750); err != nil {
@@ -104,7 +89,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		os.RemoveAll(workDir)
 	}()
 
-	// 1. Resolve backup ID
+	// 1. Resolve backup metadata
 	meta, err := r.resolveBackup(ctx)
 	if err != nil {
 		return fmt.Errorf("resolve backup: %w", err)
@@ -113,12 +98,14 @@ func (r *Runner) Run(ctx context.Context) error {
 		zap.String("backup_id", meta.BackupID),
 		zap.String("binlog_file", meta.BinlogFile),
 		zap.Uint32("binlog_pos", meta.BinlogPos),
+		zap.String("compression", meta.Compression),
+		zap.Int64("size_bytes", meta.SizeBytes),
 		zap.Time("backup_time", meta.FinishTime),
 	)
 
-	// 2. Download + extract full backup
+	// 2. Streaming download + extract backup
 	backupDir := filepath.Join(workDir, "xtrabackup")
-	if err := r.downloadAndExtract(ctx, meta.BackupID, backupDir); err != nil {
+	if err := r.streamingDownloadAndExtract(ctx, meta, backupDir); err != nil {
 		return fmt.Errorf("download backup: %w", err)
 	}
 
@@ -141,7 +128,6 @@ func (r *Runner) Run(ctx context.Context) error {
 	if err := r.runShellCmd(r.cfg.MysqlStartCmd); err != nil {
 		return fmt.Errorf("start mysql: %w", err)
 	}
-	// Give MySQL a moment to start
 	time.Sleep(5 * time.Second)
 
 	// 7. Apply binlogs
@@ -159,7 +145,6 @@ func (r *Runner) resolveBackup(ctx context.Context) (*backup.Meta, error) {
 		return r.loadMeta(ctx, r.cfg.BackupID)
 	}
 
-	// Find the latest full backup whose finish time is <= TargetTime
 	prefix := r.cfg.S3Prefix
 	objects, err := r.store.ListObjects(ctx, prefix)
 	if err != nil {
@@ -201,7 +186,6 @@ func (r *Runner) resolveBackup(ctx context.Context) (*backup.Meta, error) {
 	return bestMeta, nil
 }
 
-// loadMeta loads backup metadata from S3.
 func (r *Runner) loadMeta(ctx context.Context, backupID string) (*backup.Meta, error) {
 	key := fmt.Sprintf("%s%s/backup.meta.json", r.cfg.S3Prefix, backupID)
 	rc, err := r.store.GetObject(ctx, key)
@@ -217,14 +201,26 @@ func (r *Runner) loadMeta(ctx context.Context, backupID string) (*backup.Meta, e
 	return &meta, nil
 }
 
-// downloadAndExtract downloads the backup tar.gz and extracts it to destDir.
-func (r *Runner) downloadAndExtract(ctx context.Context, backupID, destDir string) error {
+// streamingDownloadAndExtract downloads backup and extracts in a streaming fashion.
+// S3 → decompressor → xbstream → disk (no intermediate file)
+func (r *Runner) streamingDownloadAndExtract(ctx context.Context, meta *backup.Meta, destDir string) error {
 	if err := os.MkdirAll(destDir, 0o750); err != nil {
 		return fmt.Errorf("create dest dir: %w", err)
 	}
 
-	s3Key := fmt.Sprintf("%s%s/backup.tar.gz", r.cfg.S3Prefix, backupID)
-	r.logger.Info("downloading backup", zap.String("s3_key", s3Key))
+	// Determine S3 key based on compression
+	s3Key := fmt.Sprintf("%s%s/backup.xb", r.cfg.S3Prefix, meta.BackupID)
+	switch meta.Compression {
+	case "gzip":
+		s3Key = fmt.Sprintf("%s%s/backup.xb.gz", r.cfg.S3Prefix, meta.BackupID)
+	case "zstd":
+		s3Key = fmt.Sprintf("%s%s/backup.xb.zst", r.cfg.S3Prefix, meta.BackupID)
+	}
+
+	r.logger.Info("streaming download and extract",
+		zap.String("s3_key", s3Key),
+		zap.String("compression", meta.Compression),
+	)
 
 	rc, err := r.store.GetObject(ctx, s3Key)
 	if err != nil {
@@ -232,85 +228,175 @@ func (r *Runner) downloadAndExtract(ctx context.Context, backupID, destDir strin
 	}
 	defer rc.Close()
 
-	return extractTarGz(rc, destDir)
-}
+	// Build the pipeline: S3 stream → decompress → xbstream → files
+	var reader io.Reader = rc
 
-// extractTarGz extracts a .tar.gz stream into destDir.
-func extractTarGz(r io.Reader, destDir string) error {
-	gr, err := gzip.NewReader(r)
-	if err != nil {
-		return fmt.Errorf("gzip reader: %w", err)
-	}
-	defer gr.Close()
-
-	tr := tar.NewReader(gr)
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
+	// Decompression stage
+	switch meta.Compression {
+	case "gzip":
+		gr, err := gzip.NewReader(rc)
 		if err != nil {
-			return fmt.Errorf("tar next: %w", err)
+			return fmt.Errorf("gzip reader: %w", err)
 		}
-
-		target := filepath.Join(destDir, hdr.Name)
-		// Prevent path traversal
-		if !strings.HasPrefix(target, filepath.Clean(destDir)+string(os.PathSeparator)) && target != filepath.Clean(destDir) {
-			return fmt.Errorf("illegal tar path: %s", hdr.Name)
+		defer gr.Close()
+		reader = gr
+	case "zstd":
+		zr, err := zstd.NewReader(rc)
+		if err != nil {
+			return fmt.Errorf("zstd reader: %w", err)
 		}
-
-		switch hdr.Typeflag {
-		case tar.TypeDir:
-			if err := os.MkdirAll(target, os.FileMode(hdr.Mode)); err != nil {
-				return err
-			}
-		case tar.TypeReg:
-			if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil {
-				return err
-			}
-			f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode))
-			if err != nil {
-				return err
-			}
-			if _, err := io.Copy(f, tr); err != nil {
-				f.Close()
-				return err
-			}
-			f.Close()
-		}
+		defer zr.Close()
+		reader = zr
 	}
+
+	// xbstream extraction stage
+	cmd := exec.CommandContext(ctx, "xbstream", "-x", "-C", destDir)
+	cmd.Stdin = reader
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("xbstream extract: %w", err)
+	}
+
+	r.logger.Info("backup extracted successfully", zap.String("dir", destDir))
 	return nil
 }
 
-// prepareBackup runs xtrabackup --prepare on the extracted backup directory.
 func (r *Runner) prepareBackup(ctx context.Context, backupDir string) error {
 	r.logger.Info("preparing backup", zap.String("dir", backupDir))
 	cmd := exec.CommandContext(ctx, r.cfg.XtrabackupBin,
 		"--prepare",
 		fmt.Sprintf("--target-dir=%s", backupDir),
+		fmt.Sprintf("--use-memory=2G"),
 	)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
 
-// copyBack runs xtrabackup --copy-back to restore data files to MySQL data directory.
 func (r *Runner) copyBack(ctx context.Context, backupDir string) error {
-	r.logger.Info("copying back data files",
+	r.logger.Info("restoring data files",
 		zap.String("backup_dir", backupDir),
 		zap.String("data_dir", r.cfg.DataDir),
+		zap.String("method", r.cfg.CopyMethod),
 	)
-	cmd := exec.CommandContext(ctx, r.cfg.XtrabackupBin,
-		"--copy-back",
-		fmt.Sprintf("--target-dir=%s", backupDir),
-		fmt.Sprintf("--datadir=%s", r.cfg.DataDir),
-	)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+
+	switch r.cfg.CopyMethod {
+	case "move":
+		// Use xtrabackup --move-back (fast, but empties backup dir)
+		cmd := exec.CommandContext(ctx, r.cfg.XtrabackupBin,
+			"--move-back",
+			fmt.Sprintf("--target-dir=%s", backupDir),
+			fmt.Sprintf("--datadir=%s", r.cfg.DataDir),
+		)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		return cmd.Run()
+
+	case "hardlink":
+		// Use hard links - requires same filesystem
+		return r.hardlinkRestore(backupDir, r.cfg.DataDir)
+
+	default:
+		// Standard copy
+		cmd := exec.CommandContext(ctx, r.cfg.XtrabackupBin,
+			"--copy-back",
+			fmt.Sprintf("--target-dir=%s", backupDir),
+			fmt.Sprintf("--datadir=%s", r.cfg.DataDir),
+		)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		return cmd.Run()
+	}
+}
+
+// hardlinkRestore uses hard links to restore files (fast, same filesystem required).
+func (r *Runner) hardlinkRestore(srcDir, dstDir string) error {
+	// First, use xtrabackup to create the directory structure
+	// Then hardlink the actual data files
+
+	// Walk source directory and create hard links
+	return filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		relPath, err := filepath.Rel(srcDir, path)
+		if err != nil {
+			return err
+		}
+
+		dstPath := filepath.Join(dstDir, relPath)
+
+		// Check for path traversal
+		if !strings.HasPrefix(dstPath, filepath.Clean(dstDir)+string(os.PathSeparator)) && dstPath != filepath.Clean(dstDir) {
+			return fmt.Errorf("illegal path: %s", relPath)
+		}
+
+		if info.IsDir() {
+			return os.MkdirAll(dstPath, info.Mode())
+		}
+
+		// For regular files, try hard link first, fall back to copy
+		if info.Mode().IsRegular() {
+			// Ensure parent directory exists
+			if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+				return err
+			}
+
+			// Try reflink (copy-on-write) first, then hardlink, then regular copy
+			if err := r.linkOrCopy(path, dstPath); err != nil {
+				return fmt.Errorf("link/copy %s: %w", relPath, err)
+			}
+		}
+		return nil
+	})
+}
+
+// linkOrCopy tries reflink, then hardlink, then falls back to regular copy.
+func (r *Runner) linkOrCopy(src, dst string) error {
+	// Remove dst if exists
+	os.Remove(dst)
+
+	// Try reflink (copy-on-write, works on btrfs, xfs, apfs)
+	if err := reflink(src, dst); err == nil {
+		r.logger.Debug("reflinked", zap.String("file", filepath.Base(src)))
+		return nil
+	}
+
+	// Try hard link
+	if err := os.Link(src, dst); err == nil {
+		r.logger.Debug("hardlinked", zap.String("file", filepath.Base(src)))
+		return nil
+	}
+
+	// Fall back to regular copy
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	dstFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer dstFile.Close()
+
+	_, err = io.Copy(dstFile, srcFile)
+	return err
+}
+
+// reflink attempts copy-on-write clone (Linux only, requires btrfs/xfs).
+func reflink(src, dst string) error {
+	// Try using cp --reflink=auto on Linux
+	cmd := exec.Command("cp", "--reflink=auto", src, dst)
 	return cmd.Run()
 }
 
 // applyBinlogs downloads binlog files from S3 and applies them up to TargetTime.
+// Uses parallel download for multiple binlog files.
 func (r *Runner) applyBinlogs(ctx context.Context, meta *backup.Meta) error {
 	keys, err := binlog.ListBinlogsInRange(ctx, r.store, r.cfg.S3Prefix, meta.BinlogFile)
 	if err != nil {
@@ -324,20 +410,62 @@ func (r *Runner) applyBinlogs(ctx context.Context, meta *backup.Meta) error {
 
 	r.logger.Info("applying binlogs", zap.Int("count", len(keys)))
 
+	// Parallel download binlogs to temp directory, then pipe to mysqlbinlog
+	workDir := filepath.Join(r.cfg.TempDir, fmt.Sprintf("binlogs-%d", time.Now().Unix()))
+	if err := os.MkdirAll(workDir, 0o750); err != nil {
+		return err
+	}
+	defer os.RemoveAll(workDir)
+
+	// Download binlogs in parallel
+	type dlResult struct {
+		localPath string
+		err       error
+	}
+	dlCh := make(chan dlResult, len(keys))
+	var wg sync.WaitGroup
+
+	// Limit concurrency
+	sem := make(chan struct{}, r.cfg.Parallel)
+
+	for i, key := range keys {
+		wg.Add(1)
+		go func(idx int, s3Key string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			localPath := filepath.Join(workDir, filepath.Base(s3Key))
+			if err := r.store.DownloadFile(ctx, s3Key, localPath); err != nil {
+				dlCh <- dlResult{err: fmt.Errorf("download %s: %w", s3Key, err)}
+				return
+			}
+			dlCh <- dlResult{localPath: localPath}
+		}(i, key)
+	}
+	wg.Wait()
+	close(dlCh)
+
+	var localPaths []string
+	for res := range dlCh {
+		if res.err != nil {
+			return res.err
+		}
+		localPaths = append(localPaths, res.localPath)
+	}
+
 	// Build mysqlbinlog command
 	args := []string{
-		"--read-from-remote-binlog-dump-format=NON_BLOCKING",
 		fmt.Sprintf("--start-position=%d", meta.BinlogPos),
 	}
 	if !r.cfg.TargetTime.IsZero() {
 		args = append(args, fmt.Sprintf("--stop-datetime=%s", r.cfg.TargetTime.Format("2006-01-02 15:04:05")))
 	}
-	// We pipe the binlog data via stdin using "-" as the file argument
-	args = append(args, "-")
+	args = append(args, localPaths...)
 
 	mysqlbinlogCmd := exec.CommandContext(ctx, r.cfg.MysqlbinlogBin, args...)
+	mysqlbinlogCmd.Stderr = os.Stderr
 
-	// mysql client to apply the SQL
 	mysqlArgs := []string{
 		fmt.Sprintf("--host=%s", r.cfg.TargetHost),
 		fmt.Sprintf("--port=%d", r.cfg.TargetPort),
@@ -349,16 +477,10 @@ func (r *Runner) applyBinlogs(ctx context.Context, meta *backup.Meta) error {
 	}
 	mysqlCmd := exec.CommandContext(ctx, r.cfg.MysqlBin, mysqlArgs...)
 
-	// Wire: S3 binlog stream -> mysqlbinlog stdin -> mysql stdin
-	binlogReader := binlog.PipeReader(ctx, r.store, keys)
-	defer binlogReader.Close()
-
-	mysqlbinlogCmd.Stdin = binlogReader
 	mysqlbinlogOut, err := mysqlbinlogCmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("mysqlbinlog stdout pipe: %w", err)
 	}
-	mysqlbinlogCmd.Stderr = os.Stderr
 
 	mysqlCmd.Stdin = mysqlbinlogOut
 	mysqlCmd.Stdout = os.Stdout
@@ -384,14 +506,13 @@ func (r *Runner) applyBinlogs(ctx context.Context, meta *backup.Meta) error {
 	return nil
 }
 
-// runShellCmd runs an arbitrary shell command (used for start/stop MySQL).
-func (r *Runner) runShellCmd(cmd string) error {
-	if cmd == "" {
+func (r *Runner) runShellCmd(cmdStr string) error {
+	if cmdStr == "" {
 		r.logger.Warn("no shell command configured, skipping")
 		return nil
 	}
-	r.logger.Info("running shell command", zap.String("cmd", cmd))
-	c := exec.Command("sh", "-c", cmd)
+	r.logger.Info("running shell command", zap.String("cmd", cmdStr))
+	c := exec.Command("sh", "-c", cmdStr)
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr
 	return c.Run()

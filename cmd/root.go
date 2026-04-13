@@ -106,6 +106,8 @@ func backupCmd() *cobra.Command {
 		socket        string
 		xtrabackupBin string
 		tempDir       string
+		compression   string
+		parallel      int
 		verbose       bool
 	)
 
@@ -130,6 +132,8 @@ func backupCmd() *cobra.Command {
 				XtrabackupBin: xtrabackupBin,
 				TempDir:       tempDir,
 				S3Prefix:      gf.s3Prefix,
+				Compression:   compression,
+				Parallel:      parallel,
 			}, store, logger)
 
 			ctx, cancel := context.WithCancel(context.Background())
@@ -150,7 +154,9 @@ func backupCmd() *cobra.Command {
 	cmd.Flags().StringVar(&password, "password", "", "MySQL password")
 	cmd.Flags().StringVar(&socket, "socket", "", "MySQL unix socket (overrides host/port)")
 	cmd.Flags().StringVar(&xtrabackupBin, "xtrabackup-bin", "xtrabackup", "Path to xtrabackup binary")
-	cmd.Flags().StringVar(&tempDir, "temp-dir", os.TempDir(), "Temporary directory for backup files")
+	cmd.Flags().StringVar(&tempDir, "temp-dir", os.TempDir(), "Temporary directory for metadata files")
+	cmd.Flags().StringVar(&compression, "compression", "zstd", "Compression algorithm: none, gzip, zstd")
+	cmd.Flags().IntVar(&parallel, "parallel", 4, "Parallel threads for backup and upload")
 	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Verbose logging")
 
 	return cmd
@@ -169,6 +175,8 @@ func binlogCmd() *cobra.Command {
 		serverID       uint32
 		startFile      string
 		startPos       uint32
+		compression    string
+		parallel       int
 		verbose        bool
 	)
 
@@ -197,6 +205,8 @@ and uploads each completed binlog file to S3. Runs until interrupted.`,
 				ServerID:       serverID,
 				StartFile:      startFile,
 				StartPos:       startPos,
+				Compression:    compression,
+				Parallel:       parallel,
 			}, store, logger)
 
 			ctx, cancel := context.WithCancel(context.Background())
@@ -227,6 +237,8 @@ and uploads each completed binlog file to S3. Runs until interrupted.`,
 	cmd.Flags().Uint32Var(&serverID, "server-id", 99999, "Replication server ID (must be unique in cluster)")
 	cmd.Flags().StringVar(&startFile, "start-file", "", "Binlog file to start from (e.g. binlog.000001)")
 	cmd.Flags().Uint32Var(&startPos, "start-pos", 4, "Binlog position to start from")
+	cmd.Flags().StringVar(&compression, "compression", "none", "Compression: none, gzip, zstd")
+	cmd.Flags().IntVar(&parallel, "parallel", 4, "Parallel upload workers")
 	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Verbose logging")
 
 	return cmd
@@ -250,6 +262,8 @@ func restoreCmd() *cobra.Command {
 		mysqlBin         string
 		mysqlShutdown    string
 		mysqlStart       string
+		parallel         int
+		copyMethod       string
 		verbose          bool
 	)
 
@@ -295,6 +309,8 @@ restores data files, then applies binlogs up to the target time.`,
 				MysqlBin:         mysqlBin,
 				MysqlShutdownCmd: mysqlShutdown,
 				MysqlStartCmd:    mysqlStart,
+				Parallel:         parallel,
+				CopyMethod:       copyMethod,
 			}, store, logger)
 
 			ctx, cancel := context.WithCancel(context.Background())
@@ -326,6 +342,8 @@ restores data files, then applies binlogs up to the target time.`,
 	cmd.Flags().StringVar(&mysqlBin, "mysql-bin", "mysql", "Path to mysql client binary")
 	cmd.Flags().StringVar(&mysqlShutdown, "mysql-shutdown-cmd", "", "Command to stop MySQL (e.g. 'systemctl stop mysqld')")
 	cmd.Flags().StringVar(&mysqlStart, "mysql-start-cmd", "", "Command to start MySQL (e.g. 'systemctl start mysqld')")
+	cmd.Flags().IntVar(&parallel, "parallel", 4, "Parallel download threads")
+	cmd.Flags().StringVar(&copyMethod, "copy-method", "copy", "Restore method: copy (safe), move (fast, empties backup), hardlink (fast, same filesystem)")
 	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Verbose logging")
 
 	return cmd
