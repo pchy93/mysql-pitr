@@ -4,6 +4,7 @@ package binlog
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -20,8 +21,10 @@ import (
 
 const (
 	binlogSubDir   = "binlogs"
-	flushInterval  = 10 * time.Second // Reduced from 30s for lower latency
-	uploadParallel = 4                // Parallel uploads
+	flushInterval  = 10 * time.Second
+	uploadParallel = 4
+	positionFile   = "binlog-position.json"
+	maxRetries     = 3
 )
 
 // Config holds binlog puller configuration.
@@ -42,6 +45,16 @@ type Config struct {
 	Compression string
 	// Parallel upload workers
 	Parallel int
+
+	// AutoResume: automatically resume from last saved position
+	AutoResume bool
+}
+
+// Position represents the current binlog position.
+type Position struct {
+	File      string    `json:"file"`
+	Pos       uint32    `json:"pos"`
+	Timestamp time.Time `json:"timestamp"`
 }
 
 // Puller pulls binlog from MySQL and uploads segments to S3.
@@ -53,11 +66,20 @@ type Puller struct {
 	// Upload queue and worker pool
 	uploadQueue chan uploadTask
 	uploadWg    sync.WaitGroup
+
+	// Current position tracking
+	currentPos Position
+	posMutex   sync.RWMutex
+
+	// Failed uploads tracking for retry
+	failedUploads []uploadTask
+	failedMutex   sync.Mutex
 }
 
 type uploadTask struct {
 	localPath string
 	s3Key     string
+	retryCount int
 }
 
 // New creates a new binlog Puller.
@@ -89,6 +111,18 @@ func (p *Puller) Run(ctx context.Context) error {
 		return fmt.Errorf("create work dir: %w", err)
 	}
 
+	// Auto-resume from saved position if enabled
+	if p.cfg.AutoResume {
+		if pos, err := p.loadSavedPosition(ctx); err == nil && pos.File != "" {
+			p.logger.Info("resuming from saved position",
+				zap.String("file", pos.File),
+				zap.Uint32("pos", pos.Pos),
+			)
+			p.cfg.StartFile = pos.File
+			p.cfg.StartPos = pos.Pos
+		}
+	}
+
 	// Start upload workers
 	for i := 0; i < p.cfg.Parallel; i++ {
 		p.uploadWg.Add(1)
@@ -101,11 +135,31 @@ func (p *Puller) Run(ctx context.Context) error {
 		zap.Uint32("start_pos", p.cfg.StartPos),
 		zap.Int("parallel", p.cfg.Parallel),
 		zap.String("compression", p.cfg.Compression),
+		zap.Bool("auto_resume", p.cfg.AutoResume),
 	)
+
+	// Position save ticker
+	posTicker := time.NewTicker(flushInterval)
+	defer posTicker.Stop()
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-posTicker.C:
+				p.savePosition(ctx)
+			}
+		}
+	}()
 
 	for {
 		select {
 		case <-ctx.Done():
+			// Save final position
+			p.savePosition(context.Background())
+			// Retry failed uploads
+			p.retryFailedUploads(context.Background())
 			// Drain remaining uploads
 			close(p.uploadQueue)
 			p.uploadWg.Wait()
@@ -115,6 +169,7 @@ func (p *Puller) Run(ctx context.Context) error {
 
 		if err := p.pullAndUpload(ctx, workDir); err != nil {
 			if ctx.Err() != nil {
+				p.savePosition(context.Background())
 				close(p.uploadQueue)
 				p.uploadWg.Wait()
 				return ctx.Err()
@@ -122,6 +177,7 @@ func (p *Puller) Run(ctx context.Context) error {
 			p.logger.Warn("binlog pull error, retrying in 5s", zap.Error(err))
 			select {
 			case <-ctx.Done():
+				p.savePosition(context.Background())
 				close(p.uploadQueue)
 				p.uploadWg.Wait()
 				return ctx.Err()
@@ -139,8 +195,20 @@ func (p *Puller) uploadWorker(ctx context.Context, id int) {
 			p.logger.Error("upload failed",
 				zap.Int("worker", id),
 				zap.String("file", filepath.Base(task.localPath)),
+				zap.Int("retry", task.retryCount),
 				zap.Error(err),
 			)
+			// Add to failed uploads for retry (but not delete local file!)
+			task.retryCount++
+			if task.retryCount < maxRetries {
+				p.failedMutex.Lock()
+				p.failedUploads = append(p.failedUploads, task)
+				p.failedMutex.Unlock()
+			} else {
+				p.logger.Error("upload failed permanently, keeping local file",
+					zap.String("file", task.localPath),
+				)
+			}
 		}
 	}
 }
@@ -151,12 +219,87 @@ func (p *Puller) uploadFile(ctx context.Context, localPath, s3Key string) error 
 	if err := p.store.UploadFile(ctx, s3Key, localPath); err != nil {
 		return err
 	}
+	// Only remove on success
 	os.Remove(localPath)
 	p.logger.Info("uploaded binlog",
 		zap.String("file", filepath.Base(localPath)),
 		zap.Duration("duration", time.Since(start)),
 	)
 	return nil
+}
+
+// retryFailedUploads attempts to upload failed files.
+func (p *Puller) retryFailedUploads(ctx context.Context) {
+	p.failedMutex.Lock()
+	failed := p.failedUploads
+	p.failedUploads = nil
+	p.failedMutex.Unlock()
+
+	for _, task := range failed {
+		p.logger.Info("retrying failed upload",
+			zap.String("file", filepath.Base(task.localPath)),
+			zap.Int("attempt", task.retryCount+1),
+		)
+		if err := p.uploadFile(ctx, task.localPath, task.s3Key); err != nil {
+			p.logger.Error("retry failed, keeping local file",
+				zap.String("file", task.localPath),
+				zap.Error(err),
+			)
+		}
+	}
+}
+
+// loadSavedPosition loads the last saved binlog position from S3.
+func (p *Puller) loadSavedPosition(ctx context.Context) (*Position, error) {
+	key := fmt.Sprintf("%s%s/%s", p.cfg.S3Prefix, binlogSubDir, positionFile)
+	rc, err := p.store.GetObject(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+
+	var pos Position
+	if err := json.NewDecoder(rc).Decode(&pos); err != nil {
+		return nil, fmt.Errorf("decode position: %w", err)
+	}
+	return &pos, nil
+}
+
+// savePosition saves the current binlog position to S3.
+func (p *Puller) savePosition(ctx context.Context) {
+	p.posMutex.RLock()
+	pos := p.currentPos
+	p.posMutex.RUnlock()
+
+	if pos.File == "" {
+		return
+	}
+
+	pos.Timestamp = time.Now().UTC()
+	data, err := json.MarshalIndent(pos, "", "  ")
+	if err != nil {
+		p.logger.Error("marshal position", zap.Error(err))
+		return
+	}
+
+	key := fmt.Sprintf("%s%s/%s", p.cfg.S3Prefix, binlogSubDir, positionFile)
+	reader := &byteReader{data: data}
+	if err := p.store.UploadReader(ctx, key, reader, int64(len(data))); err != nil {
+		p.logger.Error("save position", zap.Error(err))
+		return
+	}
+
+	p.logger.Debug("saved position",
+		zap.String("file", pos.File),
+		zap.Uint32("pos", pos.Pos),
+	)
+}
+
+// updatePosition updates the current binlog position.
+func (p *Puller) updatePosition(file string, pos uint32) {
+	p.posMutex.Lock()
+	p.currentPos = Position{File: file, Pos: pos}
+	p.posMutex.Unlock()
 }
 
 // pullAndUpload runs mysqlbinlog and queues files for upload.
@@ -214,7 +357,30 @@ func (p *Puller) pullAndUpload(ctx context.Context, workDir string) error {
 			return ctx.Err()
 		case <-ticker.C:
 			p.queueCompletedFiles(workDir, uploaded)
+			// Update position based on current files
+			p.updatePositionFromFiles(workDir)
 		}
+	}
+}
+
+// updatePositionFromFiles updates position based on the current binlog files.
+func (p *Puller) updatePositionFromFiles(workDir string) {
+	entries, err := os.ReadDir(workDir)
+	if err != nil {
+		return
+	}
+
+	var binlogFiles []string
+	for _, e := range entries {
+		if !e.IsDir() && isBinlogFile(e.Name()) {
+			binlogFiles = append(binlogFiles, e.Name())
+		}
+	}
+
+	if len(binlogFiles) > 0 {
+		// Current file being written is the last one
+		latest := binlogFiles[len(binlogFiles)-1]
+		p.updatePosition(latest, 0) // Position 0 means "from beginning of this file"
 	}
 }
 
@@ -315,6 +481,10 @@ func ListBinlogsInRange(ctx context.Context, store *s3store.Client, s3Prefix str
 	foundStart := startFile == ""
 	for _, obj := range objects {
 		name := filepath.Base(obj.Key)
+		// Skip position file
+		if name == positionFile {
+			continue
+		}
 		// Strip compression suffix for comparison
 		baseName := strings.TrimSuffix(strings.TrimSuffix(name, ".gz"), ".zst")
 		if !foundStart {
@@ -342,17 +512,7 @@ func PipeReader(ctx context.Context, store *s3store.Client, keys []string) io.Re
 				return
 			}
 
-			// Decompress if needed
-			var reader io.Reader = rc
-			if strings.HasSuffix(key, ".gz") {
-				// gzip decompression handled in restore module
-				reader = rc
-			} else if strings.HasSuffix(key, ".zst") {
-				// zstd decompression handled in restore module
-				reader = rc
-			}
-
-			if _, err := io.Copy(pw, reader); err != nil {
+			if _, err := io.Copy(pw, rc); err != nil {
 				rc.Close()
 				pw.CloseWithError(err)
 				return
@@ -362,4 +522,19 @@ func PipeReader(ctx context.Context, store *s3store.Client, keys []string) io.Re
 	}()
 
 	return pr
+}
+
+// byteReader wraps a byte slice as an io.Reader.
+type byteReader struct {
+	data []byte
+	pos  int
+}
+
+func (r *byteReader) Read(p []byte) (int, error) {
+	if r.pos >= len(r.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data[r.pos:])
+	r.pos += n
+	return n, nil
 }

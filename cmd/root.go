@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -15,8 +16,11 @@ import (
 
 	"github.com/mysql-pitr/mysql-pitr/internal/backup"
 	"github.com/mysql-pitr/mysql-pitr/internal/binlog"
+	"github.com/mysql-pitr/mysql-pitr/internal/notify"
+	"github.com/mysql-pitr/mysql-pitr/internal/prune"
 	"github.com/mysql-pitr/mysql-pitr/internal/restore"
 	"github.com/mysql-pitr/mysql-pitr/internal/s3store"
+	"github.com/mysql-pitr/mysql-pitr/internal/verify"
 )
 
 // globalFlags are shared S3 flags.
@@ -28,6 +32,9 @@ type globalFlags struct {
 	s3SecretKey  string
 	s3PathStyle  bool
 	s3Prefix     string
+	s3SSE        string
+	s3SSEKMSKey  string
+	webhookURL   string
 }
 
 var gf globalFlags
@@ -53,11 +60,16 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&gf.s3SecretKey, "s3-secret-key", "", "S3 secret access key (or use AWS_SECRET_ACCESS_KEY env)")
 	rootCmd.PersistentFlags().BoolVar(&gf.s3PathStyle, "s3-path-style", false, "Use path-style S3 addressing (needed for MinIO)")
 	rootCmd.PersistentFlags().StringVar(&gf.s3Prefix, "s3-prefix", "mysql-pitr/", "S3 key prefix for all objects")
+	rootCmd.PersistentFlags().StringVar(&gf.s3SSE, "s3-sse", "", "S3 server-side encryption: AES256, aws:kms, aws:kms:dsse")
+	rootCmd.PersistentFlags().StringVar(&gf.s3SSEKMSKey, "s3-sse-kms-key", "", "KMS key ID for SSE-KMS (optional)")
+	rootCmd.PersistentFlags().StringVar(&gf.webhookURL, "webhook", "", "Webhook URL for notifications (optional)")
 
 	rootCmd.AddCommand(backupCmd())
 	rootCmd.AddCommand(binlogCmd())
 	rootCmd.AddCommand(restoreCmd())
 	rootCmd.AddCommand(listCmd())
+	rootCmd.AddCommand(verifyCmd())
+	rootCmd.AddCommand(pruneCmd())
 }
 
 func newS3Client() (*s3store.Client, error) {
@@ -82,6 +94,8 @@ func newS3Client() (*s3store.Client, error) {
 		AccessKeyID:     accessKey,
 		SecretAccessKey: secretKey,
 		ForcePathStyle:  gf.s3PathStyle,
+		SSEType:         gf.s3SSE,
+		SSEKMSKeyID:     gf.s3SSEKMSKey,
 	})
 }
 
@@ -95,6 +109,30 @@ func newLogger(verbose bool) *zap.Logger {
 	return logger
 }
 
+// readPasswordFromFile reads password from a file, trimming whitespace.
+func readPasswordFromFile(path string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read password file: %w", err)
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
+// resolvePassword returns password from flag, file, or env variable.
+func resolvePassword(passwordFlag, passwordFile string) (string, error) {
+	// Priority: --password > --password-file > MYSQL_PWD env
+	if passwordFlag != "" {
+		return passwordFlag, nil
+	}
+	if passwordFile != "" {
+		return readPasswordFromFile(passwordFile)
+	}
+	return os.Getenv("MYSQL_PWD"), nil
+}
+
 // ── backup ────────────────────────────────────────────────────────────────────
 
 func backupCmd() *cobra.Command {
@@ -103,6 +141,7 @@ func backupCmd() *cobra.Command {
 		port          int
 		user          string
 		password      string
+		passwordFile  string
 		socket        string
 		xtrabackupBin string
 		tempDir       string
@@ -118,16 +157,28 @@ func backupCmd() *cobra.Command {
 			logger := newLogger(verbose)
 			defer logger.Sync()
 
+			// Resolve password from flag, file, or env
+			mysqlPassword, err := resolvePassword(password, passwordFile)
+			if err != nil {
+				return err
+			}
+
 			store, err := newS3Client()
 			if err != nil {
 				return err
+			}
+
+			// Create notifier if webhook is configured
+			var notifier *notify.Notifier
+			if gf.webhookURL != "" {
+				notifier = notify.New(notify.Config{WebhookURL: gf.webhookURL}, logger)
 			}
 
 			runner := backup.New(backup.Config{
 				Host:          host,
 				Port:          port,
 				User:          user,
-				Password:      password,
+				Password:      mysqlPassword,
 				Socket:        socket,
 				XtrabackupBin: xtrabackupBin,
 				TempDir:       tempDir,
@@ -139,10 +190,23 @@ func backupCmd() *cobra.Command {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 
+			startTime := time.Now()
+			if notifier != nil {
+				notifier.NotifyBackupStarted(ctx, "pending")
+			}
+
 			backupID, err := runner.Run(ctx)
 			if err != nil {
+				if notifier != nil {
+					notifier.NotifyBackupFailed(ctx, "unknown", err.Error())
+				}
 				return fmt.Errorf("backup failed: %w", err)
 			}
+
+			if notifier != nil {
+				notifier.NotifyBackupCompleted(ctx, backupID, 0, time.Since(startTime))
+			}
+
 			fmt.Printf("Backup completed: %s\n", backupID)
 			return nil
 		},
@@ -151,7 +215,8 @@ func backupCmd() *cobra.Command {
 	cmd.Flags().StringVar(&host, "host", "127.0.0.1", "MySQL host")
 	cmd.Flags().IntVar(&port, "port", 3306, "MySQL port")
 	cmd.Flags().StringVar(&user, "user", "root", "MySQL user")
-	cmd.Flags().StringVar(&password, "password", "", "MySQL password")
+	cmd.Flags().StringVar(&password, "password", "", "MySQL password (insecure, use --password-file)")
+	cmd.Flags().StringVar(&passwordFile, "password-file", "", "Read MySQL password from file")
 	cmd.Flags().StringVar(&socket, "socket", "", "MySQL unix socket (overrides host/port)")
 	cmd.Flags().StringVar(&xtrabackupBin, "xtrabackup-bin", "xtrabackup", "Path to xtrabackup binary")
 	cmd.Flags().StringVar(&tempDir, "temp-dir", os.TempDir(), "Temporary directory for metadata files")
@@ -170,6 +235,7 @@ func binlogCmd() *cobra.Command {
 		port           int
 		user           string
 		password       string
+		passwordFile   string
 		mysqlbinlogBin string
 		tempDir        string
 		serverID       uint32
@@ -177,6 +243,7 @@ func binlogCmd() *cobra.Command {
 		startPos       uint32
 		compression    string
 		parallel       int
+		autoResume     bool
 		verbose        bool
 	)
 
@@ -184,10 +251,19 @@ func binlogCmd() *cobra.Command {
 		Use:   "binlog",
 		Short: "Continuously pull binlog from MySQL and upload to S3",
 		Long: `Pulls binlog events from MySQL using mysqlbinlog --read-from-remote-server
-and uploads each completed binlog file to S3. Runs until interrupted.`,
+and uploads each completed binlog file to S3. Runs until interrupted.
+
+With --auto-resume, the puller will automatically resume from the last saved
+position on restart, eliminating the need to manually specify --start-file.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			logger := newLogger(verbose)
 			defer logger.Sync()
+
+			// Resolve password from flag, file, or env
+			mysqlPassword, err := resolvePassword(password, passwordFile)
+			if err != nil {
+				return err
+			}
 
 			store, err := newS3Client()
 			if err != nil {
@@ -198,7 +274,7 @@ and uploads each completed binlog file to S3. Runs until interrupted.`,
 				Host:           host,
 				Port:           port,
 				User:           user,
-				Password:       password,
+				Password:       mysqlPassword,
 				MysqlbinlogBin: mysqlbinlogBin,
 				TempDir:        tempDir,
 				S3Prefix:       gf.s3Prefix,
@@ -207,6 +283,7 @@ and uploads each completed binlog file to S3. Runs until interrupted.`,
 				StartPos:       startPos,
 				Compression:    compression,
 				Parallel:       parallel,
+				AutoResume:     autoResume,
 			}, store, logger)
 
 			ctx, cancel := context.WithCancel(context.Background())
@@ -231,7 +308,8 @@ and uploads each completed binlog file to S3. Runs until interrupted.`,
 	cmd.Flags().StringVar(&host, "host", "127.0.0.1", "MySQL host")
 	cmd.Flags().IntVar(&port, "port", 3306, "MySQL port")
 	cmd.Flags().StringVar(&user, "user", "root", "MySQL user")
-	cmd.Flags().StringVar(&password, "password", "", "MySQL password")
+	cmd.Flags().StringVar(&password, "password", "", "MySQL password (insecure, use --password-file)")
+	cmd.Flags().StringVar(&passwordFile, "password-file", "", "Read MySQL password from file")
 	cmd.Flags().StringVar(&mysqlbinlogBin, "mysqlbinlog-bin", "mysqlbinlog", "Path to mysqlbinlog binary")
 	cmd.Flags().StringVar(&tempDir, "temp-dir", os.TempDir(), "Temporary directory for binlog files")
 	cmd.Flags().Uint32Var(&serverID, "server-id", 99999, "Replication server ID (must be unique in cluster)")
@@ -239,6 +317,7 @@ and uploads each completed binlog file to S3. Runs until interrupted.`,
 	cmd.Flags().Uint32Var(&startPos, "start-pos", 4, "Binlog position to start from")
 	cmd.Flags().StringVar(&compression, "compression", "none", "Compression: none, gzip, zstd")
 	cmd.Flags().IntVar(&parallel, "parallel", 4, "Parallel upload workers")
+	cmd.Flags().BoolVar(&autoResume, "auto-resume", false, "Auto resume from last saved position on restart")
 	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Verbose logging")
 
 	return cmd
@@ -248,33 +327,47 @@ and uploads each completed binlog file to S3. Runs until interrupted.`,
 
 func restoreCmd() *cobra.Command {
 	var (
-		backupID         string
-		targetTimeStr    string
-		dataDir          string
-		tempDir          string
-		targetHost       string
-		targetPort       int
-		targetUser       string
-		targetPassword   string
-		targetSocket     string
-		xtrabackupBin    string
-		mysqlbinlogBin   string
-		mysqlBin         string
-		mysqlShutdown    string
-		mysqlStart       string
-		parallel         int
-		copyMethod       string
-		verbose          bool
+		backupID            string
+		targetTimeStr       string
+		targetGTID          string
+		dataDir             string
+		tempDir             string
+		targetHost          string
+		targetPort          int
+		targetUser          string
+		targetPassword      string
+		targetPasswordFile  string
+		targetSocket        string
+		xtrabackupBin       string
+		mysqlbinlogBin      string
+		mysqlBin            string
+		mysqlAdminBin       string
+		mysqlShutdown       string
+		mysqlStart          string
+		mysqlStartTimeout   time.Duration
+		parallel            int
+		copyMethod          string
+		verbose             bool
 	)
 
 	cmd := &cobra.Command{
 		Use:   "restore",
 		Short: "Restore MySQL to a point in time from S3 backup",
 		Long: `Downloads the full backup from S3, prepares it with xtrabackup,
-restores data files, then applies binlogs up to the target time.`,
+restores data files, then applies binlogs up to the target time or GTID.
+
+Recovery options:
+- --target-time: Recover to a specific timestamp
+- --target-gtid: Recover to a specific GTID (more precise, recommended for GTID-enabled servers)`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			logger := newLogger(verbose)
 			defer logger.Sync()
+
+			// Resolve password from flag, file, or env
+			mysqlPassword, err := resolvePassword(targetPassword, targetPasswordFile)
+			if err != nil {
+				return err
+			}
 
 			store, err := newS3Client()
 			if err != nil {
@@ -294,23 +387,26 @@ restores data files, then applies binlogs up to the target time.`,
 			}
 
 			runner := restore.New(restore.Config{
-				BackupID:         backupID,
-				TargetTime:       targetTime,
-				S3Prefix:         gf.s3Prefix,
-				DataDir:          dataDir,
-				TempDir:          tempDir,
-				TargetHost:       targetHost,
-				TargetPort:       targetPort,
-				TargetUser:       targetUser,
-				TargetPassword:   targetPassword,
-				TargetSocket:     targetSocket,
-				XtrabackupBin:    xtrabackupBin,
-				MysqlbinlogBin:   mysqlbinlogBin,
-				MysqlBin:         mysqlBin,
-				MysqlShutdownCmd: mysqlShutdown,
-				MysqlStartCmd:    mysqlStart,
-				Parallel:         parallel,
-				CopyMethod:       copyMethod,
+				BackupID:          backupID,
+				TargetTime:        targetTime,
+				TargetGTID:        targetGTID,
+				S3Prefix:          gf.s3Prefix,
+				DataDir:           dataDir,
+				TempDir:           tempDir,
+				TargetHost:        targetHost,
+				TargetPort:        targetPort,
+				TargetUser:        targetUser,
+				TargetPassword:    mysqlPassword,
+				TargetSocket:      targetSocket,
+				XtrabackupBin:     xtrabackupBin,
+				MysqlbinlogBin:    mysqlbinlogBin,
+				MysqlBin:          mysqlBin,
+				MysqlAdminBin:     mysqlAdminBin,
+				MysqlShutdownCmd:  mysqlShutdown,
+				MysqlStartCmd:     mysqlStart,
+				MySQLStartTimeout: mysqlStartTimeout,
+				Parallel:          parallel,
+				CopyMethod:        copyMethod,
 			}, store, logger)
 
 			ctx, cancel := context.WithCancel(context.Background())
@@ -330,18 +426,22 @@ restores data files, then applies binlogs up to the target time.`,
 
 	cmd.Flags().StringVar(&backupID, "backup-id", "", "Backup ID to restore (default: latest before target-time)")
 	cmd.Flags().StringVar(&targetTimeStr, "target-time", "", "Point-in-time to restore to (2006-01-02T15:04:05Z)")
+	cmd.Flags().StringVar(&targetGTID, "target-gtid", "", "GTID to stop at for precise recovery (e.g., '3e11fa47-71ca-11e1-9e33:1-50')")
 	cmd.Flags().StringVar(&dataDir, "data-dir", "/var/lib/mysql", "MySQL data directory")
 	cmd.Flags().StringVar(&tempDir, "temp-dir", os.TempDir(), "Temporary directory")
 	cmd.Flags().StringVar(&targetHost, "target-host", "127.0.0.1", "Target MySQL host")
 	cmd.Flags().IntVar(&targetPort, "target-port", 3306, "Target MySQL port")
 	cmd.Flags().StringVar(&targetUser, "target-user", "root", "Target MySQL user")
-	cmd.Flags().StringVar(&targetPassword, "target-password", "", "Target MySQL password")
+	cmd.Flags().StringVar(&targetPassword, "target-password", "", "Target MySQL password (insecure, use --target-password-file)")
+	cmd.Flags().StringVar(&targetPasswordFile, "target-password-file", "", "Read target MySQL password from file")
 	cmd.Flags().StringVar(&targetSocket, "target-socket", "", "Target MySQL unix socket")
 	cmd.Flags().StringVar(&xtrabackupBin, "xtrabackup-bin", "xtrabackup", "Path to xtrabackup binary")
 	cmd.Flags().StringVar(&mysqlbinlogBin, "mysqlbinlog-bin", "mysqlbinlog", "Path to mysqlbinlog binary")
 	cmd.Flags().StringVar(&mysqlBin, "mysql-bin", "mysql", "Path to mysql client binary")
+	cmd.Flags().StringVar(&mysqlAdminBin, "mysqladmin-bin", "mysqladmin", "Path to mysqladmin binary")
 	cmd.Flags().StringVar(&mysqlShutdown, "mysql-shutdown-cmd", "", "Command to stop MySQL (e.g. 'systemctl stop mysqld')")
 	cmd.Flags().StringVar(&mysqlStart, "mysql-start-cmd", "", "Command to start MySQL (e.g. 'systemctl start mysqld')")
+	cmd.Flags().DurationVar(&mysqlStartTimeout, "mysql-start-timeout", 120*time.Second, "Timeout waiting for MySQL to start")
 	cmd.Flags().IntVar(&parallel, "parallel", 4, "Parallel download threads")
 	cmd.Flags().StringVar(&copyMethod, "copy-method", "copy", "Restore method: copy (safe), move (fast, empties backup), hardlink (fast, same filesystem)")
 	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Verbose logging")
@@ -483,4 +583,119 @@ func repeat(s string, n int) string {
 		result += s
 	}
 	return result
+}
+
+// ── verify ────────────────────────────────────────────────────────────────────
+
+func verifyCmd() *cobra.Command {
+	var (
+		backupID   string
+		all        bool
+		verifyData bool
+		tempDir    string
+		verbose    bool
+	)
+
+	cmd := &cobra.Command{
+		Use:   "verify",
+		Short: "Verify backup integrity",
+		Long: `Verifies backup integrity by:
+1. Checking backup status in metadata
+2. Downloading and computing checksum
+3. Comparing with stored checksum
+4. (Optional) Extracting and preparing backup`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			logger := newLogger(verbose)
+			defer logger.Sync()
+
+			store, err := newS3Client()
+			if err != nil {
+				return err
+			}
+
+			runner := verify.New(verify.Config{
+				S3Prefix:   gf.s3Prefix,
+				TempDir:    tempDir,
+				VerifyData: verifyData,
+			}, store, logger)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			sigCh := make(chan os.Signal, 1)
+			signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+			go func() {
+				<-sigCh
+				logger.Info("received signal, cancelling verification")
+				cancel()
+			}()
+
+			if all {
+				return runner.VerifyAll(ctx)
+			}
+			if backupID == "" {
+				return fmt.Errorf("--backup-id or --all is required")
+			}
+			return runner.Verify(ctx, backupID)
+		},
+	}
+
+	cmd.Flags().StringVar(&backupID, "backup-id", "", "Backup ID to verify")
+	cmd.Flags().BoolVar(&all, "all", false, "Verify all backups")
+	cmd.Flags().BoolVar(&verifyData, "verify-data", false, "Extract and prepare backup (slow, thorough)")
+	cmd.Flags().StringVar(&tempDir, "temp-dir", os.TempDir(), "Temporary directory for verification")
+	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Verbose logging")
+
+	return cmd
+}
+
+// ── prune ─────────────────────────────────────────────────────────────────────
+
+func pruneCmd() *cobra.Command {
+	var (
+		retentionDays  int
+		retentionCount int
+		dryRun         bool
+		verbose        bool
+	)
+
+	cmd := &cobra.Command{
+		Use:   "prune",
+		Short: "Delete old backups based on retention policy",
+		Long: `Deletes backups that exceed the retention policy:
+- --retention-days N: Delete backups older than N days
+- --retention-count N: Keep at most N most recent backups
+
+Both policies can be combined. Use --dry-run to preview without deleting.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			logger := newLogger(verbose)
+			defer logger.Sync()
+
+			store, err := newS3Client()
+			if err != nil {
+				return err
+			}
+
+			if retentionDays <= 0 && retentionCount <= 0 {
+				return fmt.Errorf("at least one of --retention-days or --retention-count must be specified")
+			}
+
+			runner := prune.New(prune.Config{
+				S3Prefix:       gf.s3Prefix,
+				RetentionDays:  retentionDays,
+				RetentionCount: retentionCount,
+				DryRun:         dryRun,
+			}, store, logger)
+
+			ctx := context.Background()
+			return runner.Run(ctx)
+		},
+	}
+
+	cmd.Flags().IntVar(&retentionDays, "retention-days", 0, "Delete backups older than N days (0 = disabled)")
+	cmd.Flags().IntVar(&retentionCount, "retention-count", 0, "Keep at most N backups (0 = unlimited)")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show what would be deleted without actually deleting")
+	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Verbose logging")
+
+	return cmd
 }
