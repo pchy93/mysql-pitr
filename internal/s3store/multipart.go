@@ -28,10 +28,20 @@ const partSize = 16 * 1024 * 1024 // 16MB per part
 
 // NewMultipartUploader initiates a new multipart upload.
 func (c *Client) NewMultipartUploader(ctx context.Context, key string) (*MultipartUploader, error) {
-	out, err := c.s3.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+	input := &s3.CreateMultipartUploadInput{
 		Bucket: aws.String(c.bucket),
 		Key:    aws.String(key),
-	})
+	}
+
+	// Apply SSE if configured
+	if sse, _ := c.sseConfig(); sse != "" {
+		input.ServerSideEncryption = sse
+	}
+	if kmsKey := c.sseKMSKey(); kmsKey != nil {
+		input.SSEKMSEncryptionContext = kmsKey
+	}
+
+	out, err := c.s3.CreateMultipartUpload(ctx, input)
 	if err != nil {
 		return nil, fmt.Errorf("create multipart upload: %w", err)
 	}

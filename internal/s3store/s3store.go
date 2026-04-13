@@ -23,12 +23,18 @@ type Config struct {
 	AccessKeyID     string
 	SecretAccessKey string
 	ForcePathStyle  bool
+	// SSEType specifies server-side encryption type: "", "AES256", or "aws:kms"
+	SSEType string
+	// SSEKMSKeyID specifies KMS key ID for SSE-KMS (optional)
+	SSEKMSKeyID string
 }
 
 // Client wraps the AWS S3 client.
 type Client struct {
-	s3     *s3.Client
-	bucket string
+	s3         *s3.Client
+	bucket     string
+	sseType    string
+	sseKMSKeyID string
 }
 
 // New creates a new S3 client from config.
@@ -60,9 +66,41 @@ func New(cfg Config) (*Client, error) {
 	}
 
 	return &Client{
-		s3:     s3.NewFromConfig(awsCfg, s3Opts...),
-		bucket: cfg.Bucket,
+		s3:          s3.NewFromConfig(awsCfg, s3Opts...),
+		bucket:      cfg.Bucket,
+		sseType:     cfg.SSEType,
+		sseKMSKeyID: cfg.SSEKMSKeyID,
 	}, nil
+}
+
+// sseConfig returns the server-side encryption configuration for uploads.
+func (c *Client) sseConfig() (types.ServerSideEncryption, *string) {
+	if c.sseType == "" {
+		return "", nil
+	}
+
+	var sse types.ServerSideEncryption
+	switch c.sseType {
+	case "AES256":
+		sse = types.ServerSideEncryptionAes256
+	case "aws:kms":
+		sse = types.ServerSideEncryptionAwsKms
+	case "aws:kms:dsse":
+		sse = types.ServerSideEncryptionAwsKmsDsse
+	default:
+		return "", nil
+	}
+	return sse, nil
+}
+
+// sseKMSKey returns the KMS key ID if SSE-KMS is enabled.
+func (c *Client) sseKMSKey() *string {
+	if c.sseType == "aws:kms" || c.sseType == "aws:kms:dsse" {
+		if c.sseKMSKeyID != "" {
+			return aws.String(c.sseKMSKeyID)
+		}
+	}
+	return nil
 }
 
 // UploadFile uploads a local file to S3 at the given key.
@@ -78,12 +116,22 @@ func (c *Client) UploadFile(ctx context.Context, key, localPath string) error {
 		return fmt.Errorf("stat file %s: %w", localPath, err)
 	}
 
-	_, err = c.s3.PutObject(ctx, &s3.PutObjectInput{
+	input := &s3.PutObjectInput{
 		Bucket:        aws.String(c.bucket),
 		Key:           aws.String(key),
 		Body:          f,
 		ContentLength: aws.Int64(stat.Size()),
-	})
+	}
+
+	// Apply SSE if configured
+	if sse, _ := c.sseConfig(); sse != "" {
+		input.ServerSideEncryption = sse
+	}
+	if kmsKey := c.sseKMSKey(); kmsKey != nil {
+		input.SSEKMSEncryptionContext = kmsKey
+	}
+
+	_, err = c.s3.PutObject(ctx, input)
 	if err != nil {
 		return fmt.Errorf("put object %s: %w", key, err)
 	}
@@ -100,6 +148,15 @@ func (c *Client) UploadReader(ctx context.Context, key string, r io.Reader, size
 	if size > 0 {
 		input.ContentLength = aws.Int64(size)
 	}
+
+	// Apply SSE if configured
+	if sse, _ := c.sseConfig(); sse != "" {
+		input.ServerSideEncryption = sse
+	}
+	if kmsKey := c.sseKMSKey(); kmsKey != nil {
+		input.SSEKMSEncryptionContext = kmsKey
+	}
+
 	_, err := c.s3.PutObject(ctx, input)
 	if err != nil {
 		return fmt.Errorf("put object %s: %w", key, err)

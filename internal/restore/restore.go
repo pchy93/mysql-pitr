@@ -26,6 +26,7 @@ import (
 type Config struct {
 	BackupID         string
 	TargetTime       time.Time
+	TargetGTID       string // GTID set to stop at (e.g., "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5")
 	S3Prefix         string
 	DataDir          string
 	TempDir          string
@@ -37,9 +38,13 @@ type Config struct {
 	XtrabackupBin    string
 	MysqlbinlogBin   string
 	MysqlBin         string
+	MysqlAdminBin    string // mysqladmin for health check
 	MysqlShutdownCmd string
 	MysqlStartCmd    string
 	Parallel         int
+
+	// MySQL startup timeout
+	MySQLStartTimeout time.Duration
 
 	// CopyMethod: "copy", "move", "hardlink"
 	// - copy: standard xtrabackup --copy-back (safest, but slowest)
@@ -66,6 +71,9 @@ func New(cfg Config, store *s3store.Client, logger *zap.Logger) *Runner {
 	if cfg.MysqlBin == "" {
 		cfg.MysqlBin = "mysql"
 	}
+	if cfg.MysqlAdminBin == "" {
+		cfg.MysqlAdminBin = "mysqladmin"
+	}
 	if cfg.TempDir == "" {
 		cfg.TempDir = os.TempDir()
 	}
@@ -74,6 +82,9 @@ func New(cfg Config, store *s3store.Client, logger *zap.Logger) *Runner {
 	}
 	if cfg.CopyMethod == "" {
 		cfg.CopyMethod = "copy"
+	}
+	if cfg.MySQLStartTimeout <= 0 {
+		cfg.MySQLStartTimeout = 120 * time.Second
 	}
 	return &Runner{cfg: cfg, store: store, logger: logger}
 }
@@ -128,7 +139,11 @@ func (r *Runner) Run(ctx context.Context) error {
 	if err := r.runShellCmd(r.cfg.MysqlStartCmd); err != nil {
 		return fmt.Errorf("start mysql: %w", err)
 	}
-	time.Sleep(5 * time.Second)
+
+	// Wait for MySQL to be ready
+	if err := r.waitForMySQL(ctx); err != nil {
+		return fmt.Errorf("wait for mysql: %w", err)
+	}
 
 	// 7. Apply binlogs
 	if err := r.applyBinlogs(ctx, meta); err != nil {
@@ -455,11 +470,20 @@ func (r *Runner) applyBinlogs(ctx context.Context, meta *backup.Meta) error {
 	}
 
 	// Build mysqlbinlog command
-	args := []string{
-		fmt.Sprintf("--start-position=%d", meta.BinlogPos),
-	}
-	if !r.cfg.TargetTime.IsZero() {
-		args = append(args, fmt.Sprintf("--stop-datetime=%s", r.cfg.TargetTime.Format("2006-01-02 15:04:05")))
+	args := []string{}
+
+	// GTID-based recovery takes precedence over time-based
+	if r.cfg.TargetGTID != "" {
+		r.logger.Info("using GTID-based recovery", zap.String("target_gtid", r.cfg.TargetGTID))
+		args = append(args,
+			"--skip-gtids",           // Don't execute GTIDs from binlog
+			fmt.Sprintf("--stop-gtid=%s", r.cfg.TargetGTID),
+		)
+	} else {
+		args = append(args, fmt.Sprintf("--start-position=%d", meta.BinlogPos))
+		if !r.cfg.TargetTime.IsZero() {
+			args = append(args, fmt.Sprintf("--stop-datetime=%s", r.cfg.TargetTime.Format("2006-01-02 15:04:05")))
+		}
 	}
 	args = append(args, localPaths...)
 
@@ -516,4 +540,53 @@ func (r *Runner) runShellCmd(cmdStr string) error {
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr
 	return c.Run()
+}
+
+// waitForMySQL waits for MySQL to become ready using mysqladmin ping.
+func (r *Runner) waitForMySQL(ctx context.Context) error {
+	r.logger.Info("waiting for MySQL to be ready",
+		zap.Duration("timeout", r.cfg.MySQLStartTimeout),
+	)
+
+	timeout := time.NewTimer(r.cfg.MySQLStartTimeout)
+	defer timeout.Stop()
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timeout.C:
+			return fmt.Errorf("timeout waiting for MySQL to start after %v", r.cfg.MySQLStartTimeout)
+		case <-ticker.C:
+			if r.isMySQLReady(ctx) {
+				r.logger.Info("MySQL is ready")
+				return nil
+			}
+		}
+	}
+}
+
+// isMySQLReady checks if MySQL is ready using mysqladmin ping.
+func (r *Runner) isMySQLReady(ctx context.Context) bool {
+	args := []string{
+		"ping",
+		fmt.Sprintf("--host=%s", r.cfg.TargetHost),
+		fmt.Sprintf("--port=%d", r.cfg.TargetPort),
+		fmt.Sprintf("--user=%s", r.cfg.TargetUser),
+		fmt.Sprintf("--password=%s", r.cfg.TargetPassword),
+	}
+	if r.cfg.TargetSocket != "" {
+		args = append(args, fmt.Sprintf("--socket=%s", r.cfg.TargetSocket))
+	}
+
+	cmd := exec.CommandContext(ctx, r.cfg.MysqlAdminBin, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		r.logger.Debug("mysqladmin ping failed", zap.Error(err), zap.String("output", string(output)))
+		return false
+	}
+	return strings.Contains(string(output), "alive") || strings.Contains(string(output), "mysqld is alive")
 }

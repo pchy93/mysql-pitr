@@ -3,8 +3,11 @@ package backup
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"os/exec"
@@ -40,15 +43,18 @@ type Config struct {
 
 // Meta holds metadata stored alongside a backup in S3.
 type Meta struct {
-	BackupID     string    `json:"backup_id"`
-	StartTime    time.Time `json:"start_time"`
-	FinishTime   time.Time `json:"finish_time"`
-	BinlogFile   string    `json:"binlog_file"`
-	BinlogPos    uint32    `json:"binlog_pos"`
-	GTIDSet      string    `json:"gtid_set,omitempty"`
-	MySQLVersion string    `json:"mysql_version,omitempty"`
-	SizeBytes    int64     `json:"size_bytes,omitempty"`
-	Compression  string    `json:"compression,omitempty"`
+	BackupID      string    `json:"backup_id"`
+	StartTime     time.Time `json:"start_time"`
+	FinishTime    time.Time `json:"finish_time"`
+	BinlogFile    string    `json:"binlog_file"`
+	BinlogPos     uint32    `json:"binlog_pos"`
+	GTIDSet       string    `json:"gtid_set,omitempty"`
+	MySQLVersion  string    `json:"mysql_version,omitempty"`
+	SizeBytes     int64     `json:"size_bytes,omitempty"`
+	Compression   string    `json:"compression,omitempty"`
+	ChecksumSHA256 string   `json:"checksum_sha256,omitempty"`
+	Status        string    `json:"status,omitempty"` // "completed", "failed"
+	ErrorMessage  string    `json:"error_message,omitempty"`
 }
 
 // Runner runs full backups.
@@ -100,8 +106,23 @@ func (r *Runner) Run(ctx context.Context) (string, error) {
 		s3Key = fmt.Sprintf("%s%s/backup.xb.zst", r.cfg.S3Prefix, backupID)
 	}
 
-	size, err := r.runStreamingBackup(ctx, metaDir, s3Key)
+	size, checksum, err := r.runStreamingBackup(ctx, metaDir, s3Key)
 	if err != nil {
+		// Cleanup: delete partial upload from S3
+		r.logger.Warn("backup failed, cleaning up partial upload", zap.Error(err))
+		if delErr := r.store.DeleteObject(context.Background(), s3Key); delErr != nil {
+			r.logger.Error("failed to delete partial upload", zap.Error(delErr))
+		}
+
+		// Mark backup as failed
+		failMeta := &Meta{
+			BackupID:     backupID,
+			StartTime:    startTime,
+			FinishTime:   time.Now().UTC(),
+			Status:       "failed",
+			ErrorMessage: err.Error(),
+		}
+		r.uploadMeta(ctx, backupID, failMeta)
 		return "", fmt.Errorf("streaming backup: %w", err)
 	}
 
@@ -111,11 +132,14 @@ func (r *Runner) Run(ctx context.Context) (string, error) {
 	}
 	meta.SizeBytes = size
 	meta.Compression = r.cfg.Compression
+	meta.ChecksumSHA256 = checksum
+	meta.Status = "completed"
 
 	r.logger.Info("xtrabackup finished",
 		zap.String("binlog_file", meta.BinlogFile),
 		zap.Uint32("binlog_pos", meta.BinlogPos),
 		zap.Int64("size_bytes", size),
+		zap.String("checksum_sha256", checksum),
 	)
 
 	if err := r.uploadMeta(ctx, backupID, meta); err != nil {
@@ -127,7 +151,8 @@ func (r *Runner) Run(ctx context.Context) (string, error) {
 }
 
 // runStreamingBackup runs xtrabackup with --stream and pipes output directly to S3.
-func (r *Runner) runStreamingBackup(ctx context.Context, metaDir, s3Key string) (int64, error) {
+// Returns (size, checksum, error).
+func (r *Runner) runStreamingBackup(ctx context.Context, metaDir, s3Key string) (int64, string, error) {
 	// Build xtrabackup command with streaming
 	args := []string{
 		"--backup",
@@ -149,7 +174,7 @@ func (r *Runner) runStreamingBackup(ctx context.Context, metaDir, s3Key string) 
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return 0, fmt.Errorf("stdout pipe: %w", err)
+		return 0, "", fmt.Errorf("stdout pipe: %w", err)
 	}
 
 	r.logger.Info("starting xtrabackup streaming",
@@ -158,23 +183,21 @@ func (r *Runner) runStreamingBackup(ctx context.Context, metaDir, s3Key string) 
 	)
 
 	if err := cmd.Start(); err != nil {
-		return 0, fmt.Errorf("start xtrabackup: %w", err)
+		return 0, "", fmt.Errorf("start xtrabackup: %w", err)
 	}
 
 	// Create streaming uploader
 	uploader, err := r.store.NewStreamingUploader(ctx, s3Key)
 	if err != nil {
 		cmd.Process.Kill()
-		return 0, fmt.Errorf("create uploader: %w", err)
+		return 0, "", fmt.Errorf("create uploader: %w", err)
 	}
 
 	// Pipe through compression if needed
 	var reader io.Reader = stdout
-	var compressor io.Closer
 
 	switch r.cfg.Compression {
 	case "gzip":
-		// For streaming gzip, we use a pipe
 		pr, pw := io.Pipe()
 		go func() {
 			gw := newGzipWriter(pw)
@@ -198,32 +221,42 @@ func (r *Runner) runStreamingBackup(ctx context.Context, metaDir, s3Key string) 
 			}
 		}()
 		reader = pr
-	default:
-		// no compression
 	}
 
-	// Copy to S3
-	size, err := io.Copy(uploader, reader)
+	// Create hash writer wrapper to compute SHA256 while uploading
+	hash := sha256.New()
+	hashWriter := &hashWriter{w: uploader, h: hash}
+
+	// Copy to S3 with hash computation
+	size, err := io.Copy(hashWriter, reader)
 	if err != nil {
 		uploader.Close()
 		cmd.Process.Kill()
-		return 0, fmt.Errorf("copy to s3: %w", err)
-	}
-
-	if compressor != nil {
-		compressor.Close()
+		return 0, "", fmt.Errorf("copy to s3: %w", err)
 	}
 
 	if err := cmd.Wait(); err != nil {
 		uploader.Close()
-		return 0, fmt.Errorf("xtrabackup wait: %w", err)
+		return 0, "", fmt.Errorf("xtrabackup wait: %w", err)
 	}
 
 	if err := uploader.Close(); err != nil {
-		return 0, fmt.Errorf("close uploader: %w", err)
+		return 0, "", fmt.Errorf("close uploader: %w", err)
 	}
 
-	return size, nil
+	checksum := hex.EncodeToString(hash.Sum(nil))
+	return size, checksum, nil
+}
+
+// hashWriter wraps an io.Writer to compute hash while writing.
+type hashWriter struct {
+	w io.Writer
+	h hash.Hash
+}
+
+func (hw *hashWriter) Write(p []byte) (int, error) {
+	hw.h.Write(p)
+	return hw.w.Write(p)
 }
 
 // extractMeta reads metadata files from the meta directory.
